@@ -3,7 +3,11 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+import matplotlib
 from scipy import stats
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
 import os
 from pathlib import Path
 from sqlalchemy import create_engine
@@ -11,6 +15,10 @@ import warnings
 
 # 警告を抑制
 warnings.filterwarnings('ignore', category=UserWarning)
+
+# matplotlibの日本語フォント設定（macOS用）
+plt.rcParams['font.family'] = 'Hiragino Sans'
+plt.rcParams['axes.unicode_minus'] = False  # マイナス記号の文字化け対策
 
 # ページ設定
 st.set_page_config(
@@ -225,6 +233,247 @@ def main():
         render_precision_recall_tab(responses_df)
 
 
+def render_residual_diagnostics(full_result, model_df):
+    """残差診断プロットを表示"""
+    
+    st.subheader("📈 残差診断")
+    
+    # 残差の計算
+    residuals = model_df['human_gap'] - full_result.fittedvalues
+    fitted_values = full_result.fittedvalues
+    
+    # 4つのプロットを作成
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    
+    # 1. 残差のヒストグラム
+    axes[0, 0].hist(residuals, bins=20, edgecolor='black', alpha=0.7)
+    axes[0, 0].axvline(x=0, color='red', linestyle='--')
+    axes[0, 0].set_xlabel('残差')
+    axes[0, 0].set_ylabel('頻度')
+    axes[0, 0].set_title('残差のヒストグラム')
+    
+    # 2. Q-Qプロット
+    stats.probplot(residuals, dist="norm", plot=axes[0, 1])
+    axes[0, 1].set_title('Q-Qプロット（正規性の確認）')
+    
+    # 3. 残差 vs 予測値
+    axes[1, 0].scatter(fitted_values, residuals, alpha=0.5)
+    axes[1, 0].axhline(y=0, color='red', linestyle='--')
+    axes[1, 0].set_xlabel('予測値')
+    axes[1, 0].set_ylabel('残差')
+    axes[1, 0].set_title('残差 vs 予測値（等分散性の確認）')
+    
+    # 4. 残差の箱ひげ図
+    axes[1, 1].boxplot(residuals)
+    axes[1, 1].set_ylabel('残差')
+    axes[1, 1].set_title('残差の箱ひげ図')
+    
+    plt.tight_layout()
+    st.pyplot(fig)
+    
+    # 統計量の表示
+    st.subheader("📊 残差の統計量")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("平均", f"{residuals.mean():.4f}")
+    col2.metric("標準偏差", f"{residuals.std():.4f}")
+    col3.metric("歪度", f"{stats.skew(residuals):.4f}")
+    col4.metric("尖度", f"{stats.kurtosis(residuals):.4f}")
+    
+    # 正規性検定
+    st.subheader("🔬 正規性検定")
+    
+    # Shapiro-Wilk検定
+    if len(residuals) <= 5000:
+        shapiro_stat, shapiro_p = stats.shapiro(residuals)
+        st.write(f"**Shapiro-Wilk検定**: W = {shapiro_stat:.4f}, p = {shapiro_p:.4f}")
+        
+        if shapiro_p > 0.05:
+            st.success("✅ 正規性の仮定は棄却されない（p > 0.05）")
+        else:
+            st.warning("⚠️ 正規性の仮定は棄却される（p < 0.05）が、サンプルサイズが大きい場合は問題になりにくい")
+    
+    # 解釈ガイド
+    st.subheader("💡 解釈ガイド")
+    
+    skewness = stats.skew(residuals)
+    kurtosis = stats.kurtosis(residuals)
+    
+    interpretation = []
+    
+    if abs(skewness) < 1:
+        interpretation.append("✅ 歪度は許容範囲内（|歪度| < 1）")
+    else:
+        interpretation.append(f"⚠️ 歪度がやや大きい（{skewness:.2f}）")
+    
+    if abs(kurtosis) < 2:
+        interpretation.append("✅ 尖度は許容範囲内（|尖度| < 2）")
+    else:
+        interpretation.append(f"⚠️ 尖度がやや大きい（{kurtosis:.2f}）")
+    
+    for item in interpretation:
+        st.write(item)
+
+
+def render_mixed_effects_model(df):
+    """混合効果モデル分析セクションの描画"""
+    st.subheader("📐 混合効果モデル分析")
+    st.caption("📌 LLM予測の寄与を「問題効果」「ユーザー効果」と分離して正確に評価します。")
+
+    # データ準備
+    # session_id を user_id として扱う
+    model_df = df[['human_gap', 'ai_gap', 'problem_id', 'session_id']].copy()
+    model_df = model_df.rename(columns={'session_id': 'user_id'})
+    model_df = model_df.dropna()
+
+    if len(model_df) < 10:
+        st.warning("データ数が不足しているため、混合効果モデル分析を実行できません。")
+        return
+
+    try:
+        with st.spinner("混合効果モデルを計算中..."):
+            # Full Model: human_gap ~ ai_gap + (1|problem_id) + (1|user_id)
+            # statsmodels mixedlm with crossed random effects
+            # We treat user_id as the main group and problem_id as a variance component
+            
+            full_model = smf.mixedlm(
+                "human_gap ~ ai_gap", 
+                data=model_df, 
+                groups=model_df["user_id"],
+                re_formula="~1", # Random intercept for user_id
+                vc_formula={"problem_id": "0 + C(problem_id)"} # Random intercept for problem_id
+            )
+            full_result = full_model.fit()
+            
+            # Null Model: human_gap ~ 1 + (1|problem_id) + (1|user_id)
+            null_model = smf.mixedlm(
+                "human_gap ~ 1", 
+                data=model_df, 
+                groups=model_df["user_id"],
+                re_formula="~1",
+                vc_formula={"problem_id": "0 + C(problem_id)"}
+            )
+            null_result = null_model.fit()
+
+            # --- 1. 分散成分 (Variance Components) ---
+            # Extract variance components
+            # full_result.vcomp gives the variance components estimates
+            # The key for user_id (groups) is usually the name of the group column or 'Group Var' if not clear?
+            # Actually for mixedlm, the group random effect is often not in vcomp if it's the main group?
+            # No, mixedlm puts the group random effect variance in the summary, but accessing it programmatically:
+            # full_result.cov_re gives the covariance matrix of random effects for the group.
+            # Since re_formula="~1", it's a scalar variance.
+            
+            # Let's check how to get sigma2_user (group random effect variance)
+            # full_result.cov_re is a DataFrame or array.
+            sigma2_user = full_result.cov_re.iloc[0, 0]
+            
+            # sigma2_problem comes from vc_formula, so it should be in vcomp
+            sigma2_problem = full_result.vcomp[0] if len(full_result.vcomp) > 0 else 0
+            # Note: vcomp is a pandas Series usually.
+            if 'problem_id' in full_result.vcomp:
+                sigma2_problem = full_result.vcomp['problem_id']
+            elif len(full_result.vcomp) > 0:
+                sigma2_problem = full_result.vcomp[0]
+            
+            sigma2_residual = full_result.scale
+            
+            total_variance = sigma2_problem + sigma2_user + sigma2_residual
+            
+            icc_problem = sigma2_problem / total_variance
+            icc_user = sigma2_user / total_variance
+            
+            # --- 2. 固定効果 (Fixed Effects) ---
+            beta_ai = full_result.params['ai_gap']
+            p_ai = full_result.pvalues['ai_gap']
+            
+            # --- 3. モデル比較 ---
+            lrt_stat = 2 * (full_result.llf - null_result.llf)
+            lrt_p = stats.chi2.sf(lrt_stat, df=1)
+            
+            # R2 Calculation
+            # Marginal R2 (Fixed effects only)
+            # Var(X*beta)
+            fixed_pred = full_result.params['Intercept'] + full_result.params['ai_gap'] * model_df['ai_gap']
+            var_fixed = fixed_pred.var()
+            
+            marginal_r2 = var_fixed / (var_fixed + total_variance) # Denominator should be total variance of Y? 
+            # Nakagawa & Schielzeth (2013):
+            # Marginal R2 = var_fixed / (var_fixed + var_random + var_residual)
+            # Conditional R2 = (var_fixed + var_random) / (var_fixed + var_random + var_residual)
+            # Here var_random = sigma2_problem + sigma2_user
+            
+            var_random = sigma2_problem + sigma2_user
+            denom = var_fixed + var_random + sigma2_residual
+            
+            marginal_r2 = var_fixed / denom
+            conditional_r2 = (var_fixed + var_random) / denom
+
+            # --- UI Rendering ---
+            
+            # 1. Summary Cards
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("問題効果 (ICC)", f"{icc_problem:.1%}")
+            col2.metric("ユーザー効果 (ICC)", f"{icc_user:.1%}")
+            col3.metric("LLM係数 (β)", f"{beta_ai:.2f}", delta=f"p={p_ai:.3g}", delta_color="off")
+            col4.metric("モデルR² (条件付)", f"{conditional_r2:.2f}")
+            
+            # 2. Variance Components Pie Chart
+            st.markdown("##### 分散成分の内訳")
+            vc_df = pd.DataFrame({
+                'Component': ['問題効果', 'ユーザー効果', '残差'],
+                'Variance': [sigma2_problem, sigma2_user, sigma2_residual]
+            })
+            fig_pie = px.pie(vc_df, values='Variance', names='Component', title='分散成分の割合')
+            fig_pie.update_layout(height=300)
+            st.plotly_chart(fig_pie, key="vc_pie")
+            
+            # 3. Fixed Effects Table
+            st.markdown("##### 固定効果の詳細")
+            fe_df = pd.DataFrame({
+                '変数': ['切片', 'ai_gap'],
+                '係数': [full_result.params['Intercept'], full_result.params['ai_gap']],
+                'SE': [full_result.bse['Intercept'], full_result.bse['ai_gap']],
+                'z値': [full_result.tvalues['Intercept'], full_result.tvalues['ai_gap']],
+                'p値': [full_result.pvalues['Intercept'], full_result.pvalues['ai_gap']],
+                '95% CI 下限': [full_result.conf_int().loc['Intercept'][0], full_result.conf_int().loc['ai_gap'][0]],
+                '95% CI 上限': [full_result.conf_int().loc['Intercept'][1], full_result.conf_int().loc['ai_gap'][1]]
+            })
+            st.dataframe(fe_df.style.format({
+                '係数': '{:.3f}', 'SE': '{:.3f}', 'z値': '{:.2f}', 'p値': '{:.4f}', 
+                '95% CI 下限': '{:.3f}', '95% CI 上限': '{:.3f}'
+            }), hide_index=True)
+            
+            # 4. Model Comparison
+            st.markdown("##### モデル比較")
+            comp_df = pd.DataFrame({
+                'モデル': ['Null (ランダム効果のみ)', 'Full (LLM予測あり)'],
+                'AIC': [null_result.aic, full_result.aic],
+                'BIC': [null_result.bic, full_result.bic],
+                'LogLik': [null_result.llf, full_result.llf]
+            })
+            st.dataframe(comp_df.style.format({'AIC': '{:.1f}', 'BIC': '{:.1f}', 'LogLik': '{:.1f}'}), hide_index=True)
+            
+            st.write(f"**尤度比検定 (LRT)**: p = {lrt_p:.4g}")
+            
+            # 5. Interpretation Guide
+            st.info(f"""
+            **📊 解釈ガイド**
+            - **LLM予測の有意性**: p値は **{p_ai:.4g}** であり、統計的に{'有意です' if p_ai < 0.05 else '有意ではありません'}。
+            - **分散説明率**: 問題とユーザーの個体差を考慮した後でも、LLMの予測は分散の **{marginal_r2:.1%}** を説明しています（周辺R²）。
+            - **効果の大きさ**: AIがGAPを1予測するごとに、実際のGAPは **{beta_ai:.2f}** 変化する傾向があります。
+            """)
+            
+            st.divider()
+            
+            # 6. Residual Diagnostics
+            render_residual_diagnostics(full_result, model_df)
+
+    except Exception as e:
+        st.error(f"モデルの計算中にエラーが発生しました: {e}")
+        st.write("詳細エラー:", e)
+
+
 def render_overview_tab(df, sessions_df):
     """全体像タブの描画"""
     st.header("📈 全体像・概要")
@@ -241,6 +490,86 @@ def render_overview_tab(df, sessions_df):
         st.metric("問題数", df['problem_id'].nunique())
     with col4:
         st.metric("ユーザー数", df['session_id'].nunique())
+    
+    st.divider()
+    
+    # === 自信度と挑戦度の相関分析 ===
+    st.subheader("🔗 人間の自信度と挑戦度の相関")
+    st.caption("📌 人間が回答した自信度と挑戦度の関係を分析します。自信度が高いほど挑戦度が低い（負の相関）傾向があるか、独立しているかを確認できます。")
+    
+    # 相関係数の計算
+    conf_chal_r, conf_chal_p = stats.pearsonr(df['confidence'], df['challenge'])
+    
+    col_corr1, col_corr2, col_corr3 = st.columns(3)
+    with col_corr1:
+        st.metric("Pearson相関係数 (r)", f"{conf_chal_r:.4f}")
+    with col_corr2:
+        st.metric("p値", f"{conf_chal_p:.4g}")
+    with col_corr3:
+        st.metric("決定係数 (R²)", f"{conf_chal_r**2:.4f}")
+    
+    # 散布図
+    fig_conf_chal = px.scatter(df, x='confidence', y='challenge',
+                               title='人間の自信度 vs 挑戦度',
+                               opacity=0.5,
+                               labels={'confidence': '自信度', 'challenge': '挑戦度'})
+    # 回帰線を追加
+    z_cc = np.polyfit(df['confidence'], df['challenge'], 1)
+    x_cc_line = np.linspace(df['confidence'].min(), df['confidence'].max(), 100)
+    y_cc_line = z_cc[0] * x_cc_line + z_cc[1]
+    fig_conf_chal.add_trace(go.Scatter(x=x_cc_line, y=y_cc_line, mode='lines',
+                                       name='回帰線', line=dict(color='red')))
+    fig_conf_chal.update_layout(height=400, xaxis_title='自信度', yaxis_title='挑戦度')
+    st.plotly_chart(fig_conf_chal, key="conf_chal_scatter")
+    
+    # 解釈
+    if abs(conf_chal_r) >= 0.7:
+        strength = "強い"
+    elif abs(conf_chal_r) >= 0.4:
+        strength = "中程度の"
+    else:
+        strength = "弱い"
+    direction = "正の" if conf_chal_r > 0 else "負の"
+    
+    if conf_chal_p < 0.05:
+        st.success(f"✅ **{strength}{direction}相関** (r = {conf_chal_r:.3f}, p < 0.05)")
+        if conf_chal_r < 0:
+            st.info("💡 自信度が高いほど挑戦度が低い傾向があります。自信がある問題ほど「簡単」と感じている可能性があります。")
+        else:
+            st.info("💡 自信度が高いほど挑戦度も高い傾向があります。難しい問題でも自信を持って回答している可能性があります。")
+    else:
+        st.warning(f"⚠️ 統計的に有意な相関は見られません (r = {conf_chal_r:.3f}, p = {conf_chal_p:.3f})")
+        st.info("💡 自信度と挑戦度は独立した評価軸として機能している可能性があります。")
+    
+    st.divider()
+    
+    # === ピアソン vs スピアマン相関の比較 ===
+    st.subheader("📊 相関係数の比較（ピアソン vs スピアマン）")
+    st.caption("📌 リッカート尺度を間隔尺度として扱うパラメトリック分析の妥当性を検証します。")
+    
+    from scipy.stats import spearmanr
+    
+    comparisons = [
+        ("自信度", "confidence", "ai_predicted_confidence"),
+        ("挑戦度", "challenge", "ai_predicted_challenge"),
+        ("GAP", "human_gap", "ai_gap"),
+    ]
+    
+    corr_results = []
+    for name, human_col, ai_col in comparisons:
+        pearson_r, _ = stats.pearsonr(df[human_col], df[ai_col])
+        spearman_r, _ = spearmanr(df[human_col], df[ai_col])
+        diff = abs(pearson_r - spearman_r)
+        corr_results.append({
+            "指標": name,
+            "ピアソン (r)": f"{pearson_r:.3f}",
+            "スピアマン (ρ)": f"{spearman_r:.3f}",
+            "差": f"{diff:.3f}",
+            "判定": "✅ 一致" if diff < 0.05 else "⚠️ 乖離あり"
+        })
+    
+    corr_df = pd.DataFrame(corr_results)
+    st.dataframe(corr_df, use_container_width=True, hide_index=True)
     
     st.divider()
     
@@ -353,6 +682,11 @@ $$RMSE = \\sqrt{\\frac{1}{n}\\sum_{i=1}^{n}(y_i - \\hat{y}_i)^2}$$
                                      name='完全一致線', line=dict(dash='dash', color='gray')))
     fig_scatter.update_layout(height=400, xaxis_title='人間GAP', yaxis_title='AI GAP')
     st.plotly_chart(fig_scatter, key="scatter_gap")
+    
+    st.divider()
+    
+    # === 混合効果モデル分析 ===
+    render_mixed_effects_model(df)
     
     st.divider()
     
@@ -491,6 +825,177 @@ $$\\hat{y}_{i,u} = \\frac{1}{n_u - 1}\\sum_{j \\in U, j \\neq i} y_j$$
     fig_baseline.update_traces(texttemplate='%{text:.2f}', textposition='outside')
     fig_baseline.update_layout(height=350, showlegend=False)
     st.plotly_chart(fig_baseline, key="baseline_mae")
+    
+    st.divider()
+    
+    # === ユーザー差の捕捉検証 ===
+    st.subheader("🔬 ユーザー差の捕捉検証")
+    st.caption("📌 LLMがユーザーごとの違いを捉えているかを統計的に検証します。問題の難易度差を除いた「純粋なユーザー差」をLLMが予測できているかを分析します。")
+    
+    with st.expander("📐 計算方法の説明"):
+        st.markdown("""
+### 残差相関とは
+
+**問題効果を除去**して、純粋なユーザー差の捕捉度を測定します。
+
+#### 計算手順
+1. **人間GAP残差** = 人間GAP - その問題の平均GAP
+2. **AI GAP残差** = AI予測GAP - その問題の平均AI予測GAP
+3. **残差相関** = 上記2つの相関係数
+
+#### 意味
+- 各問題の平均的な難しさを引き算することで、「問題による差」を除去
+- 残った差は「同じ問題に対するユーザーごとの反応の違い」
+- この残差同士の相関が高ければ、LLMは「ユーザーごとの特性」を捉えている
+
+### 問題内相関とは
+
+各問題の中で、ユーザー間の順位関係をLLMが捉えているかを測定します。
+
+$$r_{within} = \\frac{1}{P}\\sum_{p=1}^{P} r_p$$
+
+- $r_p$ = 問題 $p$ 内でのLLM予測と人間GAPの相関
+- 問題ごとに相関を計算し、全問題で平均
+        """)
+    
+    # === 残差の計算 ===
+    # 問題ごとの平均を計算
+    problem_means = df.groupby('problem_id').agg({
+        'human_gap': 'mean',
+        'ai_gap': 'mean'
+    }).rename(columns={'human_gap': 'problem_human_mean', 'ai_gap': 'problem_ai_mean'})
+    
+    df_residual = df.merge(problem_means, on='problem_id')
+    df_residual['human_gap_residual'] = df_residual['human_gap'] - df_residual['problem_human_mean']
+    df_residual['ai_gap_residual'] = df_residual['ai_gap'] - df_residual['problem_ai_mean']
+    
+    # 残差相関の計算
+    if len(df_residual) >= 2 and df_residual['human_gap_residual'].std() > 0 and df_residual['ai_gap_residual'].std() > 0:
+        residual_corr, residual_pvalue = stats.pearsonr(
+            df_residual['human_gap_residual'], 
+            df_residual['ai_gap_residual']
+        )
+    else:
+        residual_corr, residual_pvalue = 0, 1
+    
+    # === 問題内相関の計算 ===
+    within_correlations = []
+    for problem_id, group in df.groupby('problem_id'):
+        if len(group) >= 3:  # 最低3人以上のデータがある問題のみ
+            if group['human_gap'].std() > 0 and group['ai_gap'].std() > 0:
+                r, _ = stats.pearsonr(group['human_gap'], group['ai_gap'])
+                within_correlations.append({
+                    'problem_id': problem_id,
+                    'correlation': r,
+                    'n': len(group)
+                })
+    
+    within_corr_df = pd.DataFrame(within_correlations)
+    mean_within_corr = within_corr_df['correlation'].mean() if len(within_corr_df) > 0 else 0
+    
+    # === 全体相関の計算 ===
+    if len(df) >= 2 and df['human_gap'].std() > 0 and df['ai_gap'].std() > 0:
+        overall_corr, _ = stats.pearsonr(df['human_gap'], df['ai_gap'])
+    else:
+        overall_corr = 0
+    
+    # === メトリクスカード ===
+    col_m1, col_m2, col_m3 = st.columns(3)
+    
+    with col_m1:
+        st.metric(
+            "全体相関", 
+            f"{overall_corr:.3f}",
+            help="問題差＋ユーザー差が混在"
+        )
+        st.caption("問題差＋ユーザー差が混在")
+    
+    with col_m2:
+        st.metric(
+            "残差相関", 
+            f"{residual_corr:.3f}",
+            help="問題効果を除去後"
+        )
+        st.caption("問題効果を除去後")
+    
+    with col_m3:
+        st.metric(
+            "問題内相関の平均", 
+            f"{mean_within_corr:.3f}",
+            help=f"{len(within_corr_df)}問の平均"
+        )
+        st.caption(f"{len(within_corr_df)}問の平均")
+    
+    # === 解釈ガイド ===
+    if residual_corr > 0.3:
+        st.success(f"✅ **残差相関 = {residual_corr:.3f}**: LLMはユーザーごとの違いを捉えている証拠がある")
+    elif residual_corr > 0.1:
+        st.warning(f"⚠️ **残差相関 = {residual_corr:.3f}**: 弱いがユーザー差を一部捉えている可能性")
+    else:
+        st.error(f"❌ **残差相関 = {residual_corr:.3f}**: ユーザー差は捉えておらず、問題差のみを反映している可能性")
+    
+    # === グラフ ===
+    col_g1, col_g2 = st.columns(2)
+    
+    with col_g1:
+        # 残差の散布図
+        fig_residual = px.scatter(
+            df_residual, 
+            x='human_gap_residual', 
+            y='ai_gap_residual',
+            title=f'残差の散布図 (r={residual_corr:.3f})',
+            labels={'human_gap_residual': '人間GAP残差', 'ai_gap_residual': 'AI GAP残差'},
+            opacity=0.6
+        )
+        # 回帰線を追加
+        if residual_corr != 0:
+            x_range = [df_residual['human_gap_residual'].min(), df_residual['human_gap_residual'].max()]
+            slope = residual_corr * df_residual['ai_gap_residual'].std() / df_residual['human_gap_residual'].std()
+            y_range = [slope * x for x in x_range]
+            fig_residual.add_trace(go.Scatter(x=x_range, y=y_range, mode='lines', 
+                                              name='回帰線', line=dict(color='red', dash='dash')))
+        fig_residual.update_layout(height=350)
+        st.plotly_chart(fig_residual, key="residual_scatter")
+    
+    with col_g2:
+        # 問題内相関のヒストグラム
+        if len(within_corr_df) > 0:
+            fig_within = px.histogram(
+                within_corr_df, 
+                x='correlation', 
+                nbins=15,
+                title=f'問題内相関の分布（平均={mean_within_corr:.3f}）',
+                labels={'correlation': '相関係数', 'count': '問題数'},
+                color_discrete_sequence=['#636EFA']
+            )
+            fig_within.add_vline(x=mean_within_corr, line_dash="dash", line_color="red",
+                                 annotation_text=f"平均: {mean_within_corr:.2f}")
+            fig_within.add_vline(x=0, line_dash="dot", line_color="gray")
+            fig_within.update_layout(height=350, xaxis_range=[-1, 1])
+            st.plotly_chart(fig_within, key="within_corr_hist")
+        else:
+            st.info("問題内相関を計算するには、各問題に3人以上の回答が必要です。")
+    
+    # === 問題内相関の詳細テーブル ===
+    if len(within_corr_df) > 0:
+        with st.expander("📋 問題内相関の詳細"):
+            # 知識要素を追加
+            within_corr_df['knowledge_component'] = within_corr_df['problem_id'].map(
+                df.groupby('problem_id')['knowledge_component'].first()
+            )
+            within_corr_df = within_corr_df.sort_values('correlation', ascending=False)
+            
+            display_within = within_corr_df[['knowledge_component', 'correlation', 'n']].copy()
+            display_within.columns = ['知識要素', '相関係数', '回答数']
+            display_within['相関係数'] = display_within['相関係数'].round(3)
+            st.dataframe(display_within, hide_index=True)
+            
+            # 相関が高い/低い問題
+            st.markdown("**相関が高い問題TOP3（ユーザー差を捉えている）**")
+            st.dataframe(display_within.head(3), hide_index=True)
+            
+            st.markdown("**相関が低い問題TOP3（ユーザー差を捉えていない）**")
+            st.dataframe(display_within.tail(3), hide_index=True)
 
 
 def render_problem_tab(df, problems_df):
@@ -621,6 +1126,106 @@ def render_problem_tab(df, problems_df):
         fig_pie = px.pie(pie_data, values='問題数', names='結果', title='勝敗割合')
         fig_pie.update_layout(height=250)
         st.plotly_chart(fig_pie, key="pie_problem")
+    
+    st.divider()
+    
+
+    
+    # === AIの予測と問題平均が乖離しやすい問題 ===
+    st.subheader("🤖 AIの予測と問題平均が乖離した問題")
+    st.caption("📌 AIが予測したGAPと問題平均GAPの差が大きい問題を表示します。AIが問題の特性を正しく捉えられていない、または過剰/過小に予測している問題を特定できます。")
+    
+    # 問題ごとにAI予測GAPと問題平均GAPの差を計算
+    # 各問題について、AI予測の平均と問題の人間GAP平均を比較
+    problem_ai_analysis = df.groupby('problem_id').agg({
+        'ai_gap': 'mean',
+        'human_gap': 'mean',
+        'problem_mean_gap': 'first',  # 問題平均GAPは同じ問題で同一
+        'confidence': 'mean',  # 人間の自信度平均
+        'challenge': 'mean',   # 人間の挑戦度平均
+        'ai_predicted_confidence': 'mean',  # AI予測自信度平均
+        'ai_predicted_challenge': 'mean',   # AI予測挑戦度平均
+        'knowledge_component': 'first',
+        'description_main': 'first',
+        'description_sub': 'first'
+    }).reset_index()
+    
+    # AIの予測と人間の実際の平均GAPの差
+    problem_ai_analysis['ai_vs_human_diff'] = (problem_ai_analysis['ai_gap'] - problem_ai_analysis['human_gap']).abs()
+    problem_ai_analysis = problem_ai_analysis.sort_values('ai_vs_human_diff', ascending=False)
+    problem_ai_analysis['problem_short'] = problem_ai_analysis['problem_id'].str[:8]
+    
+    # 棒グラフで可視化
+    fig_ai_diff = px.bar(problem_ai_analysis, 
+                         x='knowledge_component', 
+                         y='ai_vs_human_diff',
+                         title='問題別: AI予測GAPと人間平均GAPの差（降順）',
+                         color='ai_vs_human_diff',
+                         color_continuous_scale='Oranges',
+                         hover_data=['ai_gap', 'human_gap'])
+    fig_ai_diff.update_layout(height=400, xaxis_title='知識要素', yaxis_title='|AI予測 - 人間平均|')
+    fig_ai_diff.update_xaxes(tickangle=-45)
+    st.plotly_chart(fig_ai_diff, key="ai_problem_diff")
+    
+    # 上位の問題を詳細表示
+    st.markdown("### AI予測が大きくハズレた問題の詳細")
+    
+    # 表示件数のスライダー
+    total_problems = len(problem_ai_analysis)
+    show_count = st.slider("表示件数", min_value=1, max_value=total_problems, value=min(5, total_problems), key="ai_diff_slider")
+    
+    # 乖離が大きい順にソート済み（problem_ai_analysisはai_vs_human_diffで降順ソート済み）
+    top_ai_diff = problem_ai_analysis.head(show_count)
+    
+    for rank, (idx, row) in enumerate(top_ai_diff.iterrows(), 1):
+        diff_direction = "過大評価" if row['ai_gap'] > row['human_gap'] else "過小評価"
+        emoji = "📈" if row['ai_gap'] > row['human_gap'] else "📉"
+        
+        with st.expander(f"{rank}位 {emoji} {row['knowledge_component']} | AI{diff_direction} | 差: {row['ai_vs_human_diff']:.2f}"):
+            col_stats, col_scores, col_content = st.columns([1, 1, 2])
+            
+            with col_stats:
+                st.markdown("**GAP統計**")
+                st.metric("AI予測GAP（平均）", f"{row['ai_gap']:.2f}")
+                st.metric("人間GAP（平均）", f"{row['human_gap']:.2f}")
+                st.metric("差", f"{row['ai_vs_human_diff']:.2f}")
+                
+                if row['ai_gap'] > row['human_gap']:
+                    st.error(f"🔺 AIは人間より **{row['ai_vs_human_diff']:.2f}** 高く予測")
+                else:
+                    st.warning(f"🔻 AIは人間より **{row['ai_vs_human_diff']:.2f}** 低く予測")
+            
+            with col_scores:
+                st.markdown("**自信度・挑戦度**")
+                st.markdown("##### 人間")
+                st.write(f"- 自信度: **{row['confidence']:.2f}**")
+                st.write(f"- 挑戦度: **{row['challenge']:.2f}**")
+                st.markdown("##### AI予測")
+                st.write(f"- 自信度: **{row['ai_predicted_confidence']:.2f}**")
+                st.write(f"- 挑戦度: **{row['ai_predicted_challenge']:.2f}**")
+                
+                # 自信度・挑戦度の差
+                conf_diff = row['ai_predicted_confidence'] - row['confidence']
+                chal_diff = row['ai_predicted_challenge'] - row['challenge']
+                st.markdown("##### 差（AI - 人間）")
+                st.write(f"- 自信度差: **{conf_diff:+.2f}**")
+                st.write(f"- 挑戦度差: **{chal_diff:+.2f}**")
+            
+            with col_content:
+                st.markdown("**問題内容**")
+                st.markdown(f"**知識要素**: {row['knowledge_component']}")
+                st.markdown(f"**問題文**: {row['description_main']}")
+                if pd.notna(row['description_sub']) and row['description_sub']:
+                    st.markdown(f"**補足**: {row['description_sub']}")
+    
+    # サマリーテーブル
+    st.markdown("### 全問題のAI予測乖離サマリー")
+    ai_summary_df = problem_ai_analysis[['knowledge_component', 'ai_gap', 'human_gap', 'ai_vs_human_diff',
+                                          'confidence', 'challenge', 'ai_predicted_confidence', 'ai_predicted_challenge']].copy()
+    ai_summary_df.columns = ['知識要素', 'AI予測GAP', '人間GAP', 'GAP差', 
+                             '人間自信度', '人間挑戦度', 'AI自信度', 'AI挑戦度']
+    ai_summary_df = ai_summary_df.round(2)
+    st.dataframe(ai_summary_df, hide_index=True)
 
 
 def render_user_tab(df, sessions_df):
