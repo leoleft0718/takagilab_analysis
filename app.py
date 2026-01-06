@@ -749,6 +749,359 @@ $$\\text{±k以内} = \\frac{\\sum_{i=1}^{n} \\mathbb{1}[|y_i - \\hat{y}_i| \\le
     
     st.divider()
     
+    # === 適合率・再現率分析 ===
+    st.subheader("🎯 推薦システム評価: 適合率・再現率")
+    st.caption("📌 AIが「適切なGAP」と予測した問題が、実際に人間にとっても適切だったかを検証します。閾値を変更して、異なる基準での精度を確認できます。")
+    
+    with st.expander("📐 計算方法の説明"):
+        st.markdown("""
+### 適合率・再現率の定義
+
+**「適切な問題」の定義**: |GAP| ≤ 閾値（閾値以下のGAPを「適切」とみなす）
+
+#### 適合率（Precision）
+$$\\text{Precision} = \\frac{TP}{TP + FP}$$
+
+- AIが「適切」と予測した中で、実際に「適切」だった割合
+- 「AIが推薦した問題のうち、本当に適切だった割合」
+- 高いほど、誤推薦が少ない
+
+#### 再現率（Recall）
+$$\\text{Recall} = \\frac{TP}{TP + FN}$$
+
+- 実際に「適切」な問題のうち、AIも「適切」と予測した割合
+- 「本当に適切な問題のうち、AIが見つけられた割合」
+- 高いほど、見逃しが少ない
+
+#### F1スコア
+$$F1 = \\frac{2 \\times \\text{Precision} \\times \\text{Recall}}{\\text{Precision} + \\text{Recall}}$$
+
+- 適合率と再現率の調和平均
+- 両方のバランスを取った総合指標
+
+#### 混同行列
+| | 実際に適切 | 実際に不適切 |
+|---|---|---|
+| **予測: 適切** | TP (True Positive) | FP (False Positive) |
+| **予測: 不適切** | FN (False Negative) | TN (True Negative) |
+        """)
+    
+    # 閾値選択（インタラクティブ）
+    st.markdown("**🎚️ 閾値の設定**")
+    threshold = st.slider(
+        "「適切な問題」の閾値 |GAP| ≤",
+        min_value=0,
+        max_value=5,
+        value=0,
+        step=1,
+        help="この閾値以下の|GAP|を「適切な問題」とみなします。0=完全一致、1=±1以内、2=±2以内..."
+    )
+    
+    # 閾値の説明
+    threshold_descriptions = {
+        0: "**閾値 0**: GAP = 0 のみを「適切」と判定（最も厳しい基準）",
+        1: "**閾値 1**: |GAP| ≤ 1 を「適切」と判定（±1の誤差を許容）",
+        2: "**閾値 2**: |GAP| ≤ 2 を「適切」と判定（±2の誤差を許容）",
+        3: "**閾値 3**: |GAP| ≤ 3 を「適切」と判定（比較的緩い基準）",
+        4: "**閾値 4**: |GAP| ≤ 4 を「適切」と判定（緩い基準）",
+        5: "**閾値 5**: |GAP| ≤ 5 を「適切」と判定（最も緩い基準）",
+    }
+    st.info(threshold_descriptions.get(threshold, ""))
+    
+    # 適合率・再現率計算
+    ai_pred_appropriate = (np.abs(df['ai_gap']) <= threshold)
+    human_actual_appropriate = (np.abs(df['human_gap']) <= threshold)
+    
+    tp = (ai_pred_appropriate & human_actual_appropriate).sum()
+    fp = (ai_pred_appropriate & ~human_actual_appropriate).sum()
+    fn = (~ai_pred_appropriate & human_actual_appropriate).sum()
+    tn = (~ai_pred_appropriate & ~human_actual_appropriate).sum()
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    accuracy = (tp + tn) / len(df)
+    
+    # データ分布
+    st.markdown("**データ分布**")
+    col_dist1, col_dist2, col_dist3 = st.columns(3)
+    with col_dist1:
+        st.metric(f"人間 |GAP|≤{threshold}", f"{human_actual_appropriate.sum()}件", f"{human_actual_appropriate.mean()*100:.1f}%")
+    with col_dist2:
+        st.metric(f"AI |GAP|≤{threshold}", f"{ai_pred_appropriate.sum()}件", f"{ai_pred_appropriate.mean()*100:.1f}%")
+    with col_dist3:
+        st.metric("総回答数", f"{len(df)}件")
+    
+    # 混同行列
+    st.markdown("**混同行列**")
+    confusion_df = pd.DataFrame({
+        '': [f'予測: 適切 (|GAP|≤{threshold})', f'予測: 不適切 (|GAP|>{threshold})'],
+        '実際: 適切': [tp, fn],
+        '実際: 不適切': [fp, tn]
+    })
+    st.dataframe(confusion_df, hide_index=True)
+    
+    # 評価指標
+    st.markdown("**評価指標**")
+    col_pr1, col_pr2, col_pr3, col_pr4 = st.columns(4)
+    with col_pr1:
+        st.metric("適合率 (Precision)", f"{precision*100:.1f}%", help="予測「適切」のうち本当に適切だった割合")
+    with col_pr2:
+        st.metric("再現率 (Recall)", f"{recall*100:.1f}%", help="実際「適切」のうちAIが見つけた割合")
+    with col_pr3:
+        st.metric("F1スコア", f"{f1*100:.1f}%", help="適合率と再現率の調和平均")
+    with col_pr4:
+        st.metric("正解率 (Accuracy)", f"{accuracy*100:.1f}%", help="全体の正解率")
+    
+    # 解釈
+    st.markdown("**📊 解釈**")
+    if precision > 0.5:
+        st.success(f"✅ 適合率 {precision*100:.1f}%: AIが「適切」と予測した問題の過半数が実際に適切")
+    elif precision > 0.3:
+        st.warning(f"⚠️ 適合率 {precision*100:.1f}%: 一定の精度あり、改善の余地あり")
+    else:
+        st.error(f"❌ 適合率 {precision*100:.1f}%: 誤推薦が多い")
+    
+    if recall > 0.5:
+        st.success(f"✅ 再現率 {recall*100:.1f}%: 実際に適切な問題の過半数をAIが発見")
+    elif recall > 0.3:
+        st.warning(f"⚠️ 再現率 {recall*100:.1f}%: 見逃しがやや多い")
+    else:
+        st.error(f"❌ 再現率 {recall*100:.1f}%: 適切な問題の多くを見逃している")
+    
+    # 可視化: 混同行列のヒートマップ
+    col_viz1, col_viz2 = st.columns(2)
+    
+    with col_viz1:
+        confusion_matrix = np.array([[tp, fp], [fn, tn]])
+        
+        fig_cm = go.Figure(data=go.Heatmap(
+            z=confusion_matrix,
+            x=['実際: 適切', '実際: 不適切'],
+            y=['予測: 適切', '予測: 不適切'],
+            text=[[f'TP={tp}', f'FP={fp}'], [f'FN={fn}', f'TN={tn}']],
+            texttemplate='%{text}',
+            textfont={"size": 16},
+            colorscale='Blues',
+            showscale=False
+        ))
+        fig_cm.update_layout(
+            title=f'混同行列 (|GAP| ≤ {threshold})',
+            height=350,
+            xaxis_title='実際',
+            yaxis_title='予測'
+        )
+        st.plotly_chart(fig_cm, key=f"confusion_matrix_gap{threshold}")
+    
+    with col_viz2:
+        # 適合率・再現率の棒グラフ
+        metrics_pr_df = pd.DataFrame({
+            '指標': ['適合率', '再現率', 'F1スコア', '正解率'],
+            '値': [precision*100, recall*100, f1*100, accuracy*100]
+        })
+        fig_pr = px.bar(
+            metrics_pr_df, x='指標', y='値',
+            title=f'評価指標（|GAP| ≤ {threshold}）',
+            color='指標',
+            text='値'
+        )
+        fig_pr.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+        fig_pr.update_layout(height=350, showlegend=False, yaxis_range=[0, 100])
+        st.plotly_chart(fig_pr, key=f"precision_recall_bar_gap{threshold}")
+    
+    st.divider()
+    
+    # === 自信度からGAP予測 ===
+    st.subheader("🔮 自信度からGAP予測: |GAP| ≤ 1 の予測可能性")
+    st.caption("📌 AI予測自信度が特定の値の時、人間のGAPが1以下になる確率を分析します。自信度が高い/低い時に適切な問題（|GAP|≤1）を推薦できるかを検証します。")
+    
+    with st.expander("📐 分析の説明"):
+        st.markdown("""
+### 自信度ベースのGAP予測
+
+**目的**: AI予測自信度を使って「適切な問題（|人間GAP| ≤ 1）」を推薦できるか検証
+
+**分析内容**:
+1. **自信度別の|GAP|≤1達成率**: 各自信度で、人間GAPが1以下になる確率
+2. **予測精度**: 特定の自信度閾値で「適切」と判定した時の適合率・再現率
+
+**解釈**:
+- 自信度が高い（4-5）時に|GAP|≤1の割合が高ければ、自信度は推薦指標として有効
+- 自信度が低い（1-2）時に|GAP|≤1の割合が低ければ、自信度は推薦除外の指標として有効
+        """)
+    
+    # 自信度別の分析
+    st.markdown("**📊 AI予測自信度別の |人間GAP| ≤ 1 達成率**")
+    
+    confidence_gap_analysis = []
+    for conf in sorted(df['ai_predicted_confidence'].unique()):
+        subset = df[df['ai_predicted_confidence'] == conf]
+        gap_within_1 = (np.abs(subset['human_gap']) <= 1).sum()
+        gap_total = len(subset)
+        rate = gap_within_1 / gap_total * 100 if gap_total > 0 else 0
+        avg_human_gap = subset['human_gap'].mean()
+        avg_abs_gap = np.abs(subset['human_gap']).mean()
+        confidence_gap_analysis.append({
+            'AI予測自信度': int(conf),
+            '件数': gap_total,
+            '|GAP|≤1 件数': gap_within_1,
+            '|GAP|≤1 達成率': rate,
+            '人間GAP平均': avg_human_gap,
+            '|人間GAP|平均': avg_abs_gap
+        })
+    
+    conf_gap_df = pd.DataFrame(confidence_gap_analysis)
+    
+    # テーブル表示
+    display_conf_df = conf_gap_df.copy()
+    display_conf_df['|GAP|≤1 達成率'] = display_conf_df['|GAP|≤1 達成率'].round(1).astype(str) + '%'
+    display_conf_df['人間GAP平均'] = display_conf_df['人間GAP平均'].round(2)
+    display_conf_df['|人間GAP|平均'] = display_conf_df['|人間GAP|平均'].round(2)
+    st.dataframe(display_conf_df, hide_index=True)
+    
+    # 可視化
+    col_conf1, col_conf2 = st.columns(2)
+    
+    with col_conf1:
+        # 達成率の棒グラフ
+        fig_conf_rate = px.bar(
+            conf_gap_df, 
+            x='AI予測自信度', 
+            y='|GAP|≤1 達成率',
+            title='AI予測自信度別 |GAP|≤1 達成率',
+            color='|GAP|≤1 達成率',
+            color_continuous_scale='RdYlGn',
+            text='|GAP|≤1 達成率'
+        )
+        fig_conf_rate.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+        fig_conf_rate.update_layout(height=400, xaxis=dict(tickmode='linear'), yaxis_range=[0, 100])
+        st.plotly_chart(fig_conf_rate, key="confidence_gap_rate")
+    
+    with col_conf2:
+        # |人間GAP|平均の棒グラフ
+        fig_conf_gap = px.bar(
+            conf_gap_df, 
+            x='AI予測自信度', 
+            y='|人間GAP|平均',
+            title='AI予測自信度別 |人間GAP|平均',
+            color='|人間GAP|平均',
+            color_continuous_scale='RdYlGn_r',
+            text='|人間GAP|平均'
+        )
+        fig_conf_gap.update_traces(texttemplate='%{text:.2f}', textposition='outside')
+        fig_conf_gap.update_layout(height=400, xaxis=dict(tickmode='linear'))
+        st.plotly_chart(fig_conf_gap, key="confidence_avg_gap")
+    
+    # 自信度閾値による推薦の適合率・再現率
+    st.markdown("**🎯 自信度範囲による |GAP|≤1 推薦の適合率・再現率**")
+    st.caption("AI予測自信度が指定範囲内の問題を「適切（|GAP|≤1になりやすい）」と推薦した場合の精度。中程度の自信度が適切な問題を示す可能性を検証します。")
+    
+    # 範囲選択スライダー
+    conf_range = st.slider(
+        "自信度の範囲（この範囲内を「適切」と推薦）",
+        min_value=1,
+        max_value=6,
+        value=(2, 4),
+        step=1,
+        key="conf_range_slider"
+    )
+    conf_min, conf_max = conf_range
+    
+    # 範囲の説明
+    if conf_min == conf_max:
+        range_desc = f"自信度 = {conf_min} のみ"
+    else:
+        range_desc = f"自信度 {conf_min} ～ {conf_max}"
+    st.info(f"**選択範囲**: {range_desc}（中程度の自信度が適切な問題を示すと仮定）")
+    
+    # 自信度範囲での適合率・再現率
+    pred_appropriate_conf = (df['ai_predicted_confidence'] >= conf_min) & (df['ai_predicted_confidence'] <= conf_max)
+    actual_appropriate_gap = np.abs(df['human_gap']) <= 1
+    
+    tp_conf = (pred_appropriate_conf & actual_appropriate_gap).sum()
+    fp_conf = (pred_appropriate_conf & ~actual_appropriate_gap).sum()
+    fn_conf = (~pred_appropriate_conf & actual_appropriate_gap).sum()
+    tn_conf = (~pred_appropriate_conf & ~actual_appropriate_gap).sum()
+    
+    precision_conf = tp_conf / (tp_conf + fp_conf) if (tp_conf + fp_conf) > 0 else 0
+    recall_conf = tp_conf / (tp_conf + fn_conf) if (tp_conf + fn_conf) > 0 else 0
+    f1_conf = 2 * precision_conf * recall_conf / (precision_conf + recall_conf) if (precision_conf + recall_conf) > 0 else 0
+    
+    col_conf_m1, col_conf_m2, col_conf_m3, col_conf_m4 = st.columns(4)
+    with col_conf_m1:
+        st.metric("適合率", f"{precision_conf*100:.1f}%", help=f"{range_desc}の{tp_conf+fp_conf}件中、|GAP|≤1は{tp_conf}件")
+    with col_conf_m2:
+        st.metric("再現率", f"{recall_conf*100:.1f}%", help=f"|GAP|≤1の{tp_conf+fn_conf}件中、{range_desc}は{tp_conf}件")
+    with col_conf_m3:
+        st.metric("F1スコア", f"{f1_conf*100:.1f}%")
+    with col_conf_m4:
+        st.metric("推薦件数", f"{pred_appropriate_conf.sum()}件", f"{pred_appropriate_conf.mean()*100:.1f}%")
+    
+    # 混同行列
+    st.markdown(f"**混同行列（{range_desc} で |GAP|≤1 を推薦）**")
+    confusion_conf_df = pd.DataFrame({
+        '': [f'推薦（{range_desc}）', f'非推薦（範囲外）'],
+        '実際|GAP|≤1': [tp_conf, fn_conf],
+        '実際|GAP|>1': [fp_conf, tn_conf]
+    })
+    st.dataframe(confusion_conf_df, hide_index=True)
+    
+    # 解釈
+    st.markdown("**📊 解釈**")
+    if precision_conf >= 0.5:
+        st.success(f"✅ 適合率 {precision_conf*100:.1f}%: {range_desc}の推薦は高い信頼性がある")
+    elif precision_conf >= 0.4:
+        st.success(f"✅ 適合率 {precision_conf*100:.1f}%: {range_desc}の推薦は信頼性がある")
+    elif precision_conf >= 0.3:
+        st.warning(f"⚠️ 適合率 {precision_conf*100:.1f}%: 一定の推薦精度あり")
+    else:
+        st.error(f"❌ 適合率 {precision_conf*100:.1f}%: この範囲では|GAP|≤1を予測しにくい")
+    
+    # 全範囲の比較表
+    with st.expander("📋 各自信度範囲の比較"):
+        all_conf_results = []
+        # 単一値
+        for val in range(1, 7):
+            pred = df['ai_predicted_confidence'] == val
+            actual = np.abs(df['human_gap']) <= 1
+            tp_t = (pred & actual).sum()
+            fp_t = (pred & ~actual).sum()
+            fn_t = (~pred & actual).sum()
+            prec = tp_t / (tp_t + fp_t) if (tp_t + fp_t) > 0 else 0
+            rec = tp_t / (tp_t + fn_t) if (tp_t + fn_t) > 0 else 0
+            f1_t = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+            all_conf_results.append({
+                '自信度範囲': f'{val}のみ',
+                '推薦件数': pred.sum(),
+                '適合率': f'{prec*100:.1f}%',
+                '再現率': f'{rec*100:.1f}%',
+                'F1スコア': f'{f1_t*100:.1f}%'
+            })
+        # 中程度の範囲
+        for (lo, hi) in [(2, 3), (2, 4), (3, 4), (3, 5), (1, 3)]:
+            pred = (df['ai_predicted_confidence'] >= lo) & (df['ai_predicted_confidence'] <= hi)
+            actual = np.abs(df['human_gap']) <= 1
+            tp_t = (pred & actual).sum()
+            fp_t = (pred & ~actual).sum()
+            fn_t = (~pred & actual).sum()
+            prec = tp_t / (tp_t + fp_t) if (tp_t + fp_t) > 0 else 0
+            rec = tp_t / (tp_t + fn_t) if (tp_t + fn_t) > 0 else 0
+            f1_t = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+            all_conf_results.append({
+                '自信度範囲': f'{lo}～{hi}',
+                '推薦件数': pred.sum(),
+                '適合率': f'{prec*100:.1f}%',
+                '再現率': f'{rec*100:.1f}%',
+                'F1スコア': f'{f1_t*100:.1f}%'
+            })
+        result_df = pd.DataFrame(all_conf_results)
+        # 適合率でソート（%を数値に変換してソート）
+        result_df['適合率数値'] = result_df['適合率'].str.replace('%', '').astype(float)
+        result_df = result_df.sort_values('適合率数値', ascending=False).drop('適合率数値', axis=1)
+        st.dataframe(result_df, hide_index=True)
+    
+    st.divider()
+    
     # === ベースライン総合比較 ===
     st.subheader("🆕 ベースライン総合比較")
     st.caption("📌 LLM予測の価値を検証します。単純なベースライン（平均値を予測として使う方法）と比較し、LLMがそれらを上回っているかを確認します。MAEが低いほど良い予測です。LLMが全てのベースラインを下回れば、AIによる個別予測の有効性が示されます。")
